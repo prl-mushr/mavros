@@ -33,6 +33,66 @@ static inline uint8_t get_msg_byte(const mavlink_message_t * msg, uint8_t offset
   return _MAV_PAYLOAD(msg)[offset];
 }
 
+// --- GCS bridge rate-control helpers (local patch) ---
+
+// Returns true if this GCS-originated message would reprogram the FCU's
+// MAVLink stream rates: legacy REQUEST_DATA_STREAM (msgid 66) or a
+// COMMAND_LONG/COMMAND_INT carrying MAV_CMD_SET_MESSAGE_INTERVAL (511).
+// In both COMMAND_LONG and COMMAND_INT the 'command' field is a little-endian
+// uint16 at payload offset 28 (fields are wire-ordered largest-first).
+bool Router::gcs_is_rate_control(const mavlink_message_t * msg) const
+{
+  constexpr uint32_t MSGID_REQUEST_DATA_STREAM = 66;
+  constexpr uint32_t MSGID_COMMAND_INT = 75;
+  constexpr uint32_t MSGID_COMMAND_LONG = 76;
+  constexpr uint16_t CMD_SET_MESSAGE_INTERVAL = 511;
+
+  if (msg->msgid == MSGID_REQUEST_DATA_STREAM) {
+    return true;
+  }
+  if (msg->msgid == MSGID_COMMAND_LONG || msg->msgid == MSGID_COMMAND_INT) {
+    const uint16_t command =
+      static_cast<uint16_t>(get_msg_byte(msg, 28)) |
+      (static_cast<uint16_t>(get_msg_byte(msg, 29)) << 8);
+    if (command == CMD_SET_MESSAGE_INTERVAL) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Token-bucket-free, simple last-sent throttle: drop a FCU->GCS message if the
+// same msgid was forwarded to this destination more recently than 1/hz seconds.
+bool Router::gcs_should_throttle(id_t dest_id, msgid_t msgid)
+{
+  const double hz = gcs_throttle_hz_.load();
+  if (hz <= 0.0) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lk(gcs_throttle_mu_);
+
+  // If an allow-list of msgids is configured, only those are throttled.
+  if (!gcs_throttle_msgids_.empty() &&
+    gcs_throttle_msgids_.find(msgid) == gcs_throttle_msgids_.end())
+  {
+    return false;
+  }
+
+  const uint64_t key = (static_cast<uint64_t>(dest_id) << 32) | msgid;
+  const auto now = this->now();
+  const auto min_interval = rclcpp::Duration::from_seconds(1.0 / hz);
+
+  auto it = gcs_throttle_last_.find(key);
+  if (it != gcs_throttle_last_.end() && (now - it->second) < min_interval) {
+    return true;
+  }
+  gcs_throttle_last_[key] = now;
+  return false;
+}
+
+// --- end patch ---
+
 void Router::route_message(
   Endpoint::SharedPtr src, const mavlink_message_t * msg,
   const Framing framing)
@@ -63,6 +123,26 @@ retry:
     if (src->link_type == dest->link_type) {
       continue;     // drop messages between same type FCU/GCS/UAS
     }
+
+    // --- GCS bridge rate-control (local patch) ---
+    // Stop a GCS from reprogramming the FCU's stream rates over a shared link.
+    if (gcs_block_stream_requests_.load() &&
+      src->link_type == Endpoint::Type::gcs &&
+      dest->link_type == Endpoint::Type::fcu &&
+      this->gcs_is_rate_control(msg))
+    {
+      this->stat_msg_dropped++;
+      continue;
+    }
+    // Downsample high-rate telemetry forwarded to the GCS (e.g. over WiFi).
+    if (src->link_type == Endpoint::Type::fcu &&
+      dest->link_type == Endpoint::Type::gcs &&
+      this->gcs_should_throttle(dest->id, msg->msgid))
+    {
+      this->stat_msg_dropped++;
+      continue;
+    }
+    // --- end patch ---
 
     // NOTE(vooon): current router do not allow to speak drone-to-drone.
     //              if it is needed perhaps better to add mavlink-router in front of mavros-router.
@@ -259,6 +339,16 @@ rcl_interfaces::msg::SetParametersResult Router::on_set_parameters_cb(
       update_endpoints(parameter, Type::gcs);
     } else if (name == "uas_urls") {
       update_endpoints(parameter, Type::uas);
+    } else if (name == "gcs_throttle_hz") {       // local patch
+      gcs_throttle_hz_.store(parameter.as_double());
+    } else if (name == "gcs_block_stream_requests") {     // local patch
+      gcs_block_stream_requests_.store(parameter.as_bool());
+    } else if (name == "gcs_throttle_msgids") {   // local patch
+      std::lock_guard<std::mutex> lk(gcs_throttle_mu_);
+      gcs_throttle_msgids_.clear();
+      for (const auto v : parameter.as_integer_array()) {
+        gcs_throttle_msgids_.insert(static_cast<uint32_t>(v));
+      }
     } else {
       result.successful = false;
       result.reason = "unknown parameter";

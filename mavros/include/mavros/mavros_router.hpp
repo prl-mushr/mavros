@@ -157,6 +157,29 @@ public:
     this->declare_parameter<StrV>("gcs_urls", StrV());
     this->declare_parameter<StrV>("uas_urls", StrV());
 
+    // --- GCS bridge rate-control parameters (local patch) ---
+    // gcs_throttle_hz: per-message-id rate cap (Hz) applied to traffic forwarded
+    //   to GCS endpoints (<=0 disables). gcs_throttle_msgids: which msgids to cap
+    //   (empty list == all msgids). gcs_block_stream_requests: drop GCS->FCU
+    //   REQUEST_DATA_STREAM / MAV_CMD_SET_MESSAGE_INTERVAL so a GCS cannot change
+    //   the FCU stream rate of a link it shares with MAVROS.
+    this->declare_parameter<double>("gcs_throttle_hz", 0.0);
+    this->declare_parameter<bool>("gcs_block_stream_requests", false);
+    this->declare_parameter<std::vector<int64_t>>(
+      "gcs_throttle_msgids",
+      std::vector<int64_t>{
+        1, 2, 24, 27, 28, 29, 30, 31, 32, 33, 35, 36, 62, 65, 74,
+        105, 116, 129, 141, 147, 163, 178, 182, 241});
+
+    gcs_throttle_hz_.store(this->get_parameter("gcs_throttle_hz").as_double());
+    gcs_block_stream_requests_.store(this->get_parameter("gcs_block_stream_requests").as_bool());
+    {
+      std::lock_guard<std::mutex> lk(gcs_throttle_mu_);
+      for (const auto v : this->get_parameter("gcs_throttle_msgids").as_integer_array()) {
+        gcs_throttle_msgids_.insert(static_cast<uint32_t>(v));
+      }
+    }
+
     add_service = this->create_service<mavros_msgs::srv::EndpointAdd>(
       "~/add_endpoint",
       std::bind(&Router::add_endpoint, this, _1, _2));
@@ -211,6 +234,21 @@ private:
   std::atomic<size_t> stat_msg_routed;      //!< amount of messages came to route_messages()
   std::atomic<size_t> stat_msg_sent;        //!< amount of messages sent
   std::atomic<size_t> stat_msg_dropped;     //!< amount of messages dropped
+
+  // --- GCS bridge rate-control (local patch) ---
+  // Limit traffic forwarded to GCS endpoints and stop a GCS from reprogramming
+  // the FCU stream rates when it shares a single physical FCU link with MAVROS.
+  std::atomic<double> gcs_throttle_hz_{0.0};            //!< per-msgid cap to GCS; <=0 disables
+  std::atomic<bool> gcs_block_stream_requests_{false};  //!< drop GCS->FCU stream-rate requests
+  std::mutex gcs_throttle_mu_;                          //!< guards the throttle state below
+  std::set<uint32_t> gcs_throttle_msgids_;              //!< msgids to throttle (empty == all)
+  std::unordered_map<uint64_t, rclcpp::Time> gcs_throttle_last_;  //!< (dest<<32|msgid) -> last fwd
+
+  //! True if msg is a GCS command that would change FCU stream rates.
+  bool gcs_is_rate_control(const mavlink_message_t * msg) const;
+  //! True if a FCU->GCS message of this msgid should be dropped to honor the rate cap.
+  bool gcs_should_throttle(id_t dest_id, msgid_t msgid);
+  // --- end patch ---
 
   rclcpp::Service<mavros_msgs::srv::EndpointAdd>::SharedPtr add_service;
   rclcpp::Service<mavros_msgs::srv::EndpointDel>::SharedPtr del_service;
