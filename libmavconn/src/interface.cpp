@@ -289,12 +289,16 @@ void MAVConnInterface::set_accept_unsigned_callback(mavlink::mavlink_accept_unsi
 }
 
 /**
- * Parse host:port pairs
+ * Parse host:port pairs.
+ * @param max_port  upper bound for the numeric field after ':'. Network ports use
+ *                  uint16 max; serial baud rates reuse this helper so must allow
+ *                  values like 921600 (see url_parse_serial).
  */
 static void url_parse_host(
   const std::string & host,
   std::string & host_out, int & port_out,
-  const std::string & def_host, const int def_port)
+  const std::string & def_host, const int def_port,
+  const int max_port = std::numeric_limits<uint16_t>::max())
 {
   auto parse_int_in_range = [](const std::string & value, int min, int max, const char * field) {
       size_t pos = 0;
@@ -337,7 +341,7 @@ static void url_parse_host(
   }
 
   port.assign(sep_it + 1, host.end());
-  port_out = parse_int_in_range(port, 1, std::numeric_limits<uint16_t>::max(), "port");
+  port_out = parse_int_in_range(port, 1, max_port, "port");
 }
 
 /**
@@ -400,10 +404,11 @@ static MAVConnInterface::Ptr url_parse_serial(
   std::string file_path;
   int baudrate;
 
-  // /dev/ttyACM0:57600
+  // /dev/ttyACM0:57600  (baud can exceed uint16; do not use network-port max)
+  constexpr int kMaxSerialBaud = 12000000;
   url_parse_host(
     path, file_path, baudrate, MAVConnSerial::DEFAULT_DEVICE,
-    MAVConnSerial::DEFAULT_BAUDRATE);
+    MAVConnSerial::DEFAULT_BAUDRATE, kMaxSerialBaud);
   url_parse_query(query, system_id, component_id);
 
   return std::make_shared<MAVConnSerial>(
